@@ -1,25 +1,21 @@
 package md2cfhtml
 
 import (
+	"bytes"
 	"fmt"
 	"html"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
-	"unicode/utf8"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extensionast "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/text"
 )
 
-var (
-	fenceStartPattern    = regexp.MustCompile("^(`{3,})(.*)$")
-	atxHeadingPattern    = regexp.MustCompile(`^(#{1,6})\s+(.+?)\s*$`)
-	orderedListPattern   = regexp.MustCompile(`^\s*(\d+)\.\s+(.+)$`)
-	unorderedListPattern = regexp.MustCompile(`^\s*[-*+]\s+(.+)$`)
-	tableSepPattern      = regexp.MustCompile(`^\s*\|?\s*[:\-]+(?:\s*\|\s*[:\-]+)*\s*\|?\s*$`)
-	hrPattern            = regexp.MustCompile(`^\s*(\*{3,}|-{3,}|_{3,})\s*$`)
-	urlPattern           = regexp.MustCompile(`^https?://[^\s<>"']+`)
-	fenceLanguagePattern = regexp.MustCompile(`^[A-Za-z0-9_+\-.#]+$`)
-)
+var fenceLanguagePattern = regexp.MustCompile(`^[A-Za-z0-9_+\-.#]+$`)
 
 // Options controls how markdown is converted to Confluence HTML.
 type Options struct {
@@ -50,7 +46,7 @@ func WithCodeMacroName(name string) Option {
 	}
 }
 
-// WithMermaidMacroName overrides the mermaid macro name. Default is "mermaid".
+// WithMermaidMacroName overrides the mermaid macro name. Default is "mermaid-macro".
 func WithMermaidMacroName(name string) Option {
 	return func(o *Options) {
 		if strings.TrimSpace(name) != "" {
@@ -68,7 +64,8 @@ func WithTOCMacroEnabled(enabled bool) Option {
 
 // Converter converts markdown into Confluence HTML.
 type Converter struct {
-	opts Options
+	markdown goldmark.Markdown
+	opts     Options
 }
 
 func defaultOptions() Options {
@@ -86,7 +83,17 @@ func NewConverter(options ...Option) *Converter {
 	for _, apply := range options {
 		apply(&opts)
 	}
-	return &Converter{opts: opts}
+
+	md := goldmark.New(
+		goldmark.WithExtensions(
+			extension.GFM,
+		),
+	)
+
+	return &Converter{
+		markdown: md,
+		opts:     opts,
+	}
 }
 
 // Convert converts markdown bytes to Confluence HTML bytes.
@@ -123,306 +130,312 @@ func ConvertFile(inputPath, outputPath string, options ...Option) error {
 
 // Convert converts markdown bytes to Confluence HTML bytes.
 func (c *Converter) Convert(markdown []byte) ([]byte, error) {
-	renderer := &renderer{
-		lines: splitLines(string(markdown)),
-		opts:  c.opts,
+	document := c.markdown.Parser().Parse(text.NewReader(markdown))
+	renderer := confluenceRenderer{
+		source:         markdown,
+		opts:           c.opts,
+		skipParagraphs: map[ast.Node]bool{},
 	}
-	htmlOutput, err := renderer.render()
-	if err != nil {
+
+	if err := renderer.render(document); err != nil {
 		return nil, err
 	}
-	return []byte(htmlOutput), nil
+
+	return renderer.buffer.Bytes(), nil
 }
 
-type renderer struct {
-	lines []string
-	index int
-	opts  Options
+type confluenceRenderer struct {
+	buffer         bytes.Buffer
+	source         []byte
+	opts           Options
+	skipParagraphs map[ast.Node]bool
 }
 
-func (r *renderer) render() (string, error) {
-	var output strings.Builder
-
-	for r.index < len(r.lines) {
-		line := r.lines[r.index]
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			r.index++
-			continue
+func (r *confluenceRenderer) render(document ast.Node) error {
+	err := ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		switch typed := node.(type) {
+		case *ast.Document:
+			return ast.WalkContinue, nil
+		case *ast.Heading:
+			if entering {
+				fmt.Fprintf(&r.buffer, "<h%d>", typed.Level)
+			} else {
+				fmt.Fprintf(&r.buffer, "</h%d>\n", typed.Level)
+			}
+			return ast.WalkContinue, nil
+		case *ast.Paragraph:
+			if entering {
+				if r.opts.EnableTOCMacro && r.isTOCParagraph(typed) {
+					fmt.Fprintf(&r.buffer, "<ac:structured-macro ac:name=\"%s\"></ac:structured-macro>\n", html.EscapeString(r.opts.TOCMacroName))
+					r.skipParagraphs[node] = true
+					return ast.WalkSkipChildren, nil
+				}
+				r.buffer.WriteString("<p>")
+			} else {
+				if r.skipParagraphs[node] {
+					delete(r.skipParagraphs, node)
+					return ast.WalkContinue, nil
+				}
+				r.buffer.WriteString("</p>\n")
+			}
+			return ast.WalkContinue, nil
+		case *ast.Text:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			r.writeEscaped(typed.Segment.Value(r.source))
+			if typed.HardLineBreak() {
+				r.buffer.WriteString("<br />")
+			} else if typed.SoftLineBreak() {
+				r.buffer.WriteByte('\n')
+			}
+			return ast.WalkContinue, nil
+		case *ast.String:
+			if entering {
+				r.writeEscaped(typed.Value)
+			}
+			return ast.WalkContinue, nil
+		case *ast.Emphasis:
+			if typed.Level >= 2 {
+				if entering {
+					r.buffer.WriteString("<strong>")
+				} else {
+					r.buffer.WriteString("</strong>")
+				}
+				return ast.WalkContinue, nil
+			}
+			if entering {
+				r.buffer.WriteString("<em>")
+			} else {
+				r.buffer.WriteString("</em>")
+			}
+			return ast.WalkContinue, nil
+		case *extensionast.Strikethrough:
+			if entering {
+				r.buffer.WriteString("<del>")
+			} else {
+				r.buffer.WriteString("</del>")
+			}
+			return ast.WalkContinue, nil
+		case *ast.Blockquote:
+			if entering {
+				r.buffer.WriteString("<blockquote>\n")
+			} else {
+				r.buffer.WriteString("</blockquote>\n")
+			}
+			return ast.WalkContinue, nil
+		case *ast.List:
+			if entering {
+				if typed.IsOrdered() {
+					if typed.Start > 1 {
+						fmt.Fprintf(&r.buffer, "<ol start=\"%d\">\n", typed.Start)
+					} else {
+						r.buffer.WriteString("<ol>\n")
+					}
+				} else {
+					r.buffer.WriteString("<ul>\n")
+				}
+			} else {
+				if typed.IsOrdered() {
+					r.buffer.WriteString("</ol>\n")
+				} else {
+					r.buffer.WriteString("</ul>\n")
+				}
+			}
+			return ast.WalkContinue, nil
+		case *ast.ListItem:
+			if entering {
+				r.buffer.WriteString("<li>")
+			} else {
+				r.buffer.WriteString("</li>\n")
+			}
+			return ast.WalkContinue, nil
+		case *ast.Link:
+			if entering {
+				fmt.Fprintf(&r.buffer, "<a href=\"%s\">", html.EscapeString(string(typed.Destination)))
+			} else {
+				r.buffer.WriteString("</a>")
+			}
+			return ast.WalkContinue, nil
+		case *ast.AutoLink:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			href := html.EscapeString(string(typed.URL(r.source)))
+			label := href
+			if labelBytes := typed.Label(r.source); len(labelBytes) > 0 {
+				label = html.EscapeString(string(labelBytes))
+			}
+			fmt.Fprintf(&r.buffer, "<a href=\"%s\">%s</a>", href, label)
+			return ast.WalkSkipChildren, nil
+		case *ast.Image:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			alt := html.EscapeString(strings.TrimSpace(r.plainText(node)))
+			src := html.EscapeString(string(typed.Destination))
+			if alt == "" {
+				fmt.Fprintf(&r.buffer, "<img src=\"%s\" />", src)
+			} else {
+				fmt.Fprintf(&r.buffer, "<img src=\"%s\" alt=\"%s\" />", src, alt)
+			}
+			return ast.WalkSkipChildren, nil
+		case *ast.CodeSpan:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			r.buffer.WriteString("<code>")
+			r.writeEscaped(typed.Text(r.source))
+			r.buffer.WriteString("</code>")
+			return ast.WalkSkipChildren, nil
+		case *ast.FencedCodeBlock:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			language := parseFenceLanguage(typed.Info.Text(r.source))
+			content := r.linesText(typed.Lines())
+			if strings.EqualFold(language, "mermaid") {
+				r.renderMermaidMacro(content)
+			} else {
+				r.renderCodeMacro(language, content)
+			}
+			return ast.WalkSkipChildren, nil
+		case *ast.CodeBlock:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			r.renderCodeMacro("", r.linesText(typed.Lines()))
+			return ast.WalkSkipChildren, nil
+		case *ast.ThematicBreak:
+			if entering {
+				r.buffer.WriteString("<hr />\n")
+			}
+			return ast.WalkSkipChildren, nil
+		case *extensionast.Table:
+			if entering {
+				r.buffer.WriteString("<table>\n")
+			} else {
+				r.buffer.WriteString("</table>\n")
+			}
+			return ast.WalkContinue, nil
+		case *extensionast.TableHeader:
+			if entering {
+				r.buffer.WriteString("<thead>\n")
+			} else {
+				r.buffer.WriteString("</thead>\n")
+			}
+			return ast.WalkContinue, nil
+		case *extensionast.TableRow:
+			if entering {
+				r.buffer.WriteString("<tr>\n")
+			} else {
+				r.buffer.WriteString("</tr>\n")
+			}
+			return ast.WalkContinue, nil
+		case *extensionast.TableCell:
+			if entering {
+				if r.isHeaderCell(node) {
+					r.buffer.WriteString("<th>")
+				} else {
+					r.buffer.WriteString("<td>")
+				}
+			} else {
+				if r.isHeaderCell(node) {
+					r.buffer.WriteString("</th>\n")
+				} else {
+					r.buffer.WriteString("</td>\n")
+				}
+			}
+			return ast.WalkContinue, nil
+		case *ast.HTMLBlock:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			r.buffer.Write(typed.Text(r.source))
+			r.buffer.WriteByte('\n')
+			return ast.WalkSkipChildren, nil
+		case *ast.RawHTML:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			r.buffer.Write(typed.Segments.Value(r.source))
+			return ast.WalkSkipChildren, nil
+		default:
+			return ast.WalkContinue, nil
 		}
-
-		if level, text := parseATXHeading(line); level > 0 {
-			fmt.Fprintf(&output, "<h%d>%s</h%d>\n", level, renderInline(text), level)
-			r.index++
-			continue
-		}
-
-		if level, text, ok := r.parseSetextHeading(); ok {
-			fmt.Fprintf(&output, "<h%d>%s</h%d>\n", level, renderInline(text), level)
-			r.index += 2
-			continue
-		}
-
-		if r.opts.EnableTOCMacro && strings.EqualFold(trimmed, "[TOC]") {
-			fmt.Fprintf(&output, "<ac:structured-macro ac:name=\"%s\"></ac:structured-macro>\n", html.EscapeString(r.opts.TOCMacroName))
-			r.index++
-			continue
-		}
-
-		if fence, info, ok := parseFenceStart(line); ok {
-			block, nextIndex := r.consumeFencedBlock(fence)
-			r.index = nextIndex
-			r.writeFencedBlock(&output, info, block)
-			continue
-		}
-
-		if isTableHeader(r.lines, r.index) {
-			r.writeTable(&output)
-			continue
-		}
-
-		if matchesOrderedList(line) || matchesUnorderedList(line) {
-			r.writeList(&output)
-			continue
-		}
-
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), ">") {
-			r.writeBlockquote(&output)
-			continue
-		}
-
-		if hrPattern.MatchString(trimmed) {
-			output.WriteString("<hr />\n")
-			r.index++
-			continue
-		}
-
-		r.writeParagraph(&output)
+	})
+	if err != nil {
+		return fmt.Errorf("render markdown: %w", err)
 	}
-
-	return output.String(), nil
+	return nil
 }
 
-func (r *renderer) parseSetextHeading() (int, string, bool) {
-	if r.index+1 >= len(r.lines) {
-		return 0, "", false
-	}
-	current := strings.TrimSpace(r.lines[r.index])
-	next := strings.TrimSpace(r.lines[r.index+1])
-	if current == "" {
-		return 0, "", false
-	}
-	if isAll(next, '=') {
-		return 1, current, true
-	}
-	if isAll(next, '-') {
-		return 2, current, true
-	}
-	return 0, "", false
-}
-
-func (r *renderer) consumeFencedBlock(fence string) (string, int) {
-	var body strings.Builder
-	i := r.index + 1
-	for i < len(r.lines) {
-		line := r.lines[i]
-		if strings.HasPrefix(strings.TrimSpace(line), fence) {
-			return strings.TrimSuffix(body.String(), "\n"), i + 1
-		}
-		body.WriteString(line)
-		body.WriteByte('\n')
-		i++
-	}
-	return strings.TrimSuffix(body.String(), "\n"), i
-}
-
-func (r *renderer) writeFencedBlock(output *strings.Builder, info, body string) {
-	language := parseFenceLanguage(info)
-	if strings.EqualFold(language, "mermaid") {
-		fmt.Fprintf(output, "<ac:structured-macro ac:name=\"%s\">\n", html.EscapeString(r.opts.MermaidMacroName))
-		output.WriteString("<ac:plain-text-body><![CDATA[")
-		output.WriteString(escapeCDATA(body))
-		output.WriteString("]]></ac:plain-text-body>\n")
-		output.WriteString("</ac:structured-macro>\n")
-		return
-	}
-
-	fmt.Fprintf(output, "<ac:structured-macro ac:name=\"%s\">\n", html.EscapeString(r.opts.CodeMacroName))
+func (r *confluenceRenderer) renderCodeMacro(language, content string) {
+	fmt.Fprintf(&r.buffer, "<ac:structured-macro ac:name=\"%s\">\n", html.EscapeString(r.opts.CodeMacroName))
 	if language != "" {
-		fmt.Fprintf(output, "<ac:parameter ac:name=\"language\">%s</ac:parameter>\n", html.EscapeString(language))
+		fmt.Fprintf(&r.buffer, "<ac:parameter ac:name=\"language\">%s</ac:parameter>\n", html.EscapeString(language))
 	}
-	output.WriteString("<ac:plain-text-body><![CDATA[")
-	output.WriteString(escapeCDATA(body))
-	output.WriteString("]]></ac:plain-text-body>\n")
-	output.WriteString("</ac:structured-macro>\n")
+	r.buffer.WriteString("<ac:plain-text-body><![CDATA[")
+	r.buffer.WriteString(escapeCDATA(content))
+	r.buffer.WriteString("]]></ac:plain-text-body>\n")
+	r.buffer.WriteString("</ac:structured-macro>\n")
 }
 
-func (r *renderer) writeParagraph(output *strings.Builder) {
-	var lines []string
-	for r.index < len(r.lines) {
-		line := r.lines[r.index]
-		if strings.TrimSpace(line) == "" {
-			break
-		}
-		if _, _, ok := parseFenceStart(line); ok {
-			break
-		}
-		if isTableHeader(r.lines, r.index) {
-			break
-		}
-		if matchesOrderedList(line) || matchesUnorderedList(line) {
-			break
-		}
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), ">") {
-			break
-		}
-		if hrPattern.MatchString(strings.TrimSpace(line)) {
-			break
-		}
-		if level, _ := parseATXHeading(line); level > 0 {
-			break
-		}
-		if _, _, ok := r.parseSetextHeading(); ok {
-			break
-		}
-		lines = append(lines, strings.TrimSpace(line))
-		r.index++
-	}
-
-	if len(lines) == 0 {
-		r.index++
-		return
-	}
-
-	joined := strings.Join(lines, "\n")
-	fmt.Fprintf(output, "<p>%s</p>\n", renderInline(joined))
-
-	for r.index < len(r.lines) && strings.TrimSpace(r.lines[r.index]) == "" {
-		r.index++
-	}
+func (r *confluenceRenderer) renderMermaidMacro(content string) {
+	fmt.Fprintf(&r.buffer, "<ac:structured-macro ac:name=\"%s\">\n", html.EscapeString(r.opts.MermaidMacroName))
+	r.buffer.WriteString("<ac:plain-text-body><![CDATA[")
+	r.buffer.WriteString(escapeCDATA(content))
+	r.buffer.WriteString("]]></ac:plain-text-body>\n")
+	r.buffer.WriteString("</ac:structured-macro>\n")
 }
 
-func (r *renderer) writeList(output *strings.Builder) {
-	ordered := matchesOrderedList(r.lines[r.index])
-	tag := "ul"
-	startValue := 1
-	if ordered {
-		tag = "ol"
-		if m := orderedListPattern.FindStringSubmatch(r.lines[r.index]); len(m) > 1 {
-			if value, err := strconv.Atoi(m[1]); err == nil {
-				startValue = value
-			}
-		}
+func (r *confluenceRenderer) linesText(lines *text.Segments) string {
+	var content strings.Builder
+	for i := 0; i < lines.Len(); i++ {
+		segment := lines.At(i)
+		content.Write(segment.Value(r.source))
 	}
-
-	if ordered && startValue > 1 {
-		fmt.Fprintf(output, "<%s start=\"%d\">\n", tag, startValue)
-	} else {
-		fmt.Fprintf(output, "<%s>\n", tag)
-	}
-
-	for r.index < len(r.lines) {
-		line := r.lines[r.index]
-		if strings.TrimSpace(line) == "" {
-			break
-		}
-
-		if ordered {
-			m := orderedListPattern.FindStringSubmatch(line)
-			if len(m) == 0 {
-				break
-			}
-			fmt.Fprintf(output, "<li>%s</li>\n", renderInline(strings.TrimSpace(m[2])))
-		} else {
-			m := unorderedListPattern.FindStringSubmatch(line)
-			if len(m) == 0 {
-				break
-			}
-			fmt.Fprintf(output, "<li>%s</li>\n", renderInline(strings.TrimSpace(m[1])))
-		}
-		r.index++
-	}
-
-	fmt.Fprintf(output, "</%s>\n", tag)
-	for r.index < len(r.lines) && strings.TrimSpace(r.lines[r.index]) == "" {
-		r.index++
-	}
+	return strings.TrimSuffix(content.String(), "\n")
 }
 
-func (r *renderer) writeBlockquote(output *strings.Builder) {
-	var lines []string
-	for r.index < len(r.lines) {
-		line := strings.TrimLeft(r.lines[r.index], " \t")
-		if !strings.HasPrefix(line, ">") {
-			break
-		}
-		line = strings.TrimSpace(strings.TrimPrefix(line, ">"))
-		lines = append(lines, line)
-		r.index++
-	}
-	content := strings.TrimSpace(strings.Join(lines, "\n"))
-	if content == "" {
-		return
-	}
-	fmt.Fprintf(output, "<blockquote><p>%s</p></blockquote>\n", renderInline(content))
-	for r.index < len(r.lines) && strings.TrimSpace(r.lines[r.index]) == "" {
-		r.index++
-	}
+func (r *confluenceRenderer) writeEscaped(raw []byte) {
+	r.buffer.WriteString(html.EscapeString(string(raw)))
 }
 
-func (r *renderer) writeTable(output *strings.Builder) {
-	header := parseTableRow(r.lines[r.index])
-	r.index += 2
-	output.WriteString("<table>\n")
-	output.WriteString("<tr>\n")
-	for _, cell := range header {
-		fmt.Fprintf(output, "<th>%s</th>\n", renderInline(cell))
-	}
-	output.WriteString("</tr>\n")
-
-	for r.index < len(r.lines) {
-		line := r.lines[r.index]
-		if strings.TrimSpace(line) == "" || !strings.Contains(line, "|") {
-			break
+func (r *confluenceRenderer) plainText(node ast.Node) string {
+	var content strings.Builder
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		switch typed := child.(type) {
+		case *ast.Text:
+			content.Write(typed.Segment.Value(r.source))
+		case *ast.String:
+			content.Write(typed.Value)
+		default:
+			content.WriteString(r.plainText(child))
 		}
-		row := parseTableRow(line)
-		if len(row) == 0 {
-			break
-		}
-		output.WriteString("<tr>\n")
-		for _, cell := range row {
-			fmt.Fprintf(output, "<td>%s</td>\n", renderInline(cell))
-		}
-		output.WriteString("</tr>\n")
-		r.index++
 	}
-	output.WriteString("</table>\n")
-	for r.index < len(r.lines) && strings.TrimSpace(r.lines[r.index]) == "" {
-		r.index++
-	}
+	return content.String()
 }
 
-func parseATXHeading(line string) (int, string) {
-	matches := atxHeadingPattern.FindStringSubmatch(line)
-	if len(matches) != 3 {
-		return 0, ""
-	}
-	return len(matches[1]), strings.TrimSpace(matches[2])
+func (r *confluenceRenderer) isTOCParagraph(paragraph *ast.Paragraph) bool {
+	return strings.EqualFold(strings.TrimSpace(r.plainText(paragraph)), "[TOC]")
 }
 
-func parseFenceStart(line string) (fence, info string, ok bool) {
-	matches := fenceStartPattern.FindStringSubmatch(strings.TrimSpace(line))
-	if len(matches) != 3 {
-		return "", "", false
+func (r *confluenceRenderer) isHeaderCell(node ast.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		if _, ok := parent.(*extensionast.TableHeader); ok {
+			return true
+		}
 	}
-	return matches[1], strings.TrimSpace(matches[2]), true
+	return false
 }
 
-func parseFenceLanguage(info string) string {
-	if info == "" {
+func parseFenceLanguage(info []byte) string {
+	trimmed := strings.TrimSpace(string(info))
+	if trimmed == "" {
 		return ""
 	}
-	fields := strings.Fields(info)
+	fields := strings.Fields(trimmed)
 	if len(fields) == 0 {
 		return ""
 	}
@@ -436,136 +449,6 @@ func parseFenceLanguage(info string) string {
 	return strings.ToLower(first)
 }
 
-func splitLines(input string) []string {
-	clean := strings.ReplaceAll(input, "\r\n", "\n")
-	return strings.Split(clean, "\n")
-}
-
-func isAll(value string, target rune) bool {
-	if value == "" {
-		return false
-	}
-	for _, char := range value {
-		if char != target {
-			return false
-		}
-	}
-	return true
-}
-
-func matchesOrderedList(line string) bool {
-	return orderedListPattern.MatchString(line)
-}
-
-func matchesUnorderedList(line string) bool {
-	return unorderedListPattern.MatchString(line)
-}
-
-func isTableHeader(lines []string, index int) bool {
-	if index+1 >= len(lines) {
-		return false
-	}
-	current := lines[index]
-	next := lines[index+1]
-	return strings.Contains(current, "|") && tableSepPattern.MatchString(strings.TrimSpace(next))
-}
-
-func parseTableRow(line string) []string {
-	trimmed := strings.TrimSpace(line)
-	if strings.HasPrefix(trimmed, "|") {
-		trimmed = strings.TrimPrefix(trimmed, "|")
-	}
-	if strings.HasSuffix(trimmed, "|") {
-		trimmed = strings.TrimSuffix(trimmed, "|")
-	}
-	parts := strings.Split(trimmed, "|")
-	cells := make([]string, 0, len(parts))
-	for _, part := range parts {
-		cells = append(cells, strings.TrimSpace(part))
-	}
-	return cells
-}
-
 func escapeCDATA(raw string) string {
 	return strings.ReplaceAll(raw, "]]>", "]]]]><![CDATA[>")
-}
-
-func renderInline(input string) string {
-	var output strings.Builder
-	for i := 0; i < len(input); {
-		if input[i] == '`' {
-			if end := strings.IndexByte(input[i+1:], '`'); end >= 0 {
-				content := input[i+1 : i+1+end]
-				output.WriteString("<code>")
-				output.WriteString(html.EscapeString(content))
-				output.WriteString("</code>")
-				i += end + 2
-				continue
-			}
-		}
-
-		if strings.HasPrefix(input[i:], "**") {
-			if end := strings.Index(input[i+2:], "**"); end >= 0 {
-				content := input[i+2 : i+2+end]
-				output.WriteString("<strong>")
-				output.WriteString(renderInline(content))
-				output.WriteString("</strong>")
-				i += end + 4
-				continue
-			}
-		}
-
-		if strings.HasPrefix(input[i:], "~~") {
-			if end := strings.Index(input[i+2:], "~~"); end >= 0 {
-				content := input[i+2 : i+2+end]
-				output.WriteString("<del>")
-				output.WriteString(renderInline(content))
-				output.WriteString("</del>")
-				i += end + 4
-				continue
-			}
-		}
-
-		if input[i] == '*' {
-			if end := strings.IndexByte(input[i+1:], '*'); end >= 0 {
-				content := input[i+1 : i+1+end]
-				output.WriteString("<em>")
-				output.WriteString(renderInline(content))
-				output.WriteString("</em>")
-				i += end + 2
-				continue
-			}
-		}
-
-		if input[i] == '[' {
-			if textEnd := strings.IndexByte(input[i+1:], ']'); textEnd >= 0 {
-				label := input[i+1 : i+1+textEnd]
-				restStart := i + 1 + textEnd + 1
-				if restStart < len(input) && input[restStart] == '(' {
-					if urlEnd := strings.IndexByte(input[restStart+1:], ')'); urlEnd >= 0 {
-						url := input[restStart+1 : restStart+1+urlEnd]
-						fmt.Fprintf(&output, "<a href=\"%s\">%s</a>", html.EscapeString(url), renderInline(label))
-						i = restStart + urlEnd + 2
-						continue
-					}
-				}
-			}
-		}
-
-		if match := urlPattern.FindString(input[i:]); match != "" {
-			fmt.Fprintf(&output, "<a href=\"%s\">%s</a>", html.EscapeString(match), html.EscapeString(match))
-			i += len(match)
-			continue
-		}
-
-		r, size := utf8.DecodeRuneInString(input[i:])
-		if r == utf8.RuneError && size == 1 {
-			output.WriteString(html.EscapeString(input[i : i+1]))
-			i++
-			continue
-		}
-		output.WriteString(html.EscapeString(string(r)))
-		i += size
-	}
-	return output.String()
 }
