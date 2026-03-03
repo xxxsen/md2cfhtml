@@ -146,6 +146,7 @@ func (c *Converter) Convert(markdown []byte) ([]byte, error) {
 		source:         markdown,
 		opts:           c.opts,
 		skipParagraphs: map[ast.Node]bool{},
+		taskLists:      map[ast.Node]bool{},
 	}
 
 	if err := renderer.render(document); err != nil {
@@ -160,6 +161,9 @@ type confluenceRenderer struct {
 	source         []byte
 	opts           Options
 	skipParagraphs map[ast.Node]bool
+	taskLists      map[ast.Node]bool
+	taskSequence   int
+	admonitions    []string
 }
 
 func (r *confluenceRenderer) render(document ast.Node) error {
@@ -176,6 +180,16 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			return ast.WalkContinue, nil
 		case *ast.Paragraph:
 			if entering {
+				if macroName, ok := parseAdmonitionStart(r.plainText(typed)); ok {
+					r.openAdmonition(macroName)
+					r.skipParagraphs[node] = true
+					return ast.WalkSkipChildren, nil
+				}
+				if r.hasOpenAdmonition() && isAdmonitionEnd(r.plainText(typed)) {
+					r.closeAdmonition()
+					r.skipParagraphs[node] = true
+					return ast.WalkSkipChildren, nil
+				}
 				if r.opts.EnableTOCMacro && r.isTOCParagraph(typed) {
 					fmt.Fprintf(&r.buffer, "<ac:structured-macro ac:name=\"%s\"></ac:structured-macro>\n", html.EscapeString(r.opts.TOCMacroName))
 					r.skipParagraphs[node] = true
@@ -237,7 +251,10 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			return ast.WalkContinue, nil
 		case *ast.List:
 			if entering {
-				if typed.IsOrdered() {
+				if r.isTaskList(typed) {
+					r.taskLists[node] = true
+					r.buffer.WriteString("<ac:task-list>\n")
+				} else if typed.IsOrdered() {
 					if typed.Start > 1 {
 						fmt.Fprintf(&r.buffer, "<ol start=\"%d\">\n", typed.Start)
 					} else {
@@ -247,7 +264,10 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 					r.buffer.WriteString("<ul>\n")
 				}
 			} else {
-				if typed.IsOrdered() {
+				if r.taskLists[node] {
+					delete(r.taskLists, node)
+					r.buffer.WriteString("</ac:task-list>\n")
+				} else if typed.IsOrdered() {
 					r.buffer.WriteString("</ol>\n")
 				} else {
 					r.buffer.WriteString("</ul>\n")
@@ -255,6 +275,23 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			}
 			return ast.WalkContinue, nil
 		case *ast.ListItem:
+			if r.taskLists[node.Parent()] {
+				if entering {
+					checked, _ := r.taskItemCheckboxState(typed)
+					status := "incomplete"
+					if checked {
+						status = "complete"
+					}
+					r.taskSequence++
+					r.buffer.WriteString("<ac:task>\n")
+					fmt.Fprintf(&r.buffer, "<ac:task-id>%d</ac:task-id>\n", r.taskSequence)
+					fmt.Fprintf(&r.buffer, "<ac:task-status>%s</ac:task-status>\n", status)
+					r.buffer.WriteString("<ac:task-body>")
+				} else {
+					r.buffer.WriteString("</ac:task-body>\n</ac:task>\n")
+				}
+				return ast.WalkContinue, nil
+			}
 			if entering {
 				r.buffer.WriteString("<li>")
 			} else {
@@ -272,11 +309,20 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			if !entering {
 				return ast.WalkContinue, nil
 			}
-			href := html.EscapeString(string(typed.URL(r.source)))
-			label := href
-			if labelBytes := typed.Label(r.source); len(labelBytes) > 0 {
-				label = html.EscapeString(string(labelBytes))
+			rawHref := string(typed.URL(r.source))
+			if typed.AutoLinkType == ast.AutoLinkEmail && !strings.HasPrefix(strings.ToLower(rawHref), "mailto:") {
+				rawHref = "mailto:" + rawHref
 			}
+			href := html.EscapeString(rawHref)
+			label := string(typed.Label(r.source))
+			if label == "" {
+				if typed.AutoLinkType == ast.AutoLinkEmail {
+					label = strings.TrimPrefix(rawHref, "mailto:")
+				} else {
+					label = rawHref
+				}
+			}
+			label = html.EscapeString(label)
 			fmt.Fprintf(&r.buffer, "<a href=\"%s\">%s</a>", href, label)
 			return ast.WalkSkipChildren, nil
 		case *ast.Image:
@@ -298,6 +344,19 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			r.buffer.WriteString("<code>")
 			r.writeEscaped(typed.Text(r.source))
 			r.buffer.WriteString("</code>")
+			return ast.WalkSkipChildren, nil
+		case *extensionast.TaskCheckBox:
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			// In Confluence task-list mode, checkbox state is represented by ac:task-status.
+			if !r.isInTaskListContext(node) {
+				if typed.IsChecked {
+					r.buffer.WriteString("[x] ")
+				} else {
+					r.buffer.WriteString("[ ] ")
+				}
+			}
 			return ast.WalkSkipChildren, nil
 		case *ast.FencedCodeBlock:
 			if !entering {
@@ -347,17 +406,22 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			return ast.WalkContinue, nil
 		case *extensionast.TableCell:
 			if entering {
+				tagName := "td"
 				if r.isHeaderCell(node) {
-					r.buffer.WriteString("<th>")
+					tagName = "th"
+				}
+				style := tableAlignmentStyle(typed.Alignment)
+				if style == "" {
+					fmt.Fprintf(&r.buffer, "<%s>", tagName)
 				} else {
-					r.buffer.WriteString("<td>")
+					fmt.Fprintf(&r.buffer, "<%s style=\"%s\">", tagName, style)
 				}
 			} else {
+				tagName := "td"
 				if r.isHeaderCell(node) {
-					r.buffer.WriteString("</th>\n")
-				} else {
-					r.buffer.WriteString("</td>\n")
+					tagName = "th"
 				}
+				fmt.Fprintf(&r.buffer, "</%s>\n", tagName)
 			}
 			return ast.WalkContinue, nil
 		case *ast.HTMLBlock:
@@ -379,6 +443,9 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 	})
 	if err != nil {
 		return fmt.Errorf("render markdown: %w", err)
+	}
+	for r.hasOpenAdmonition() {
+		r.closeAdmonition()
 	}
 	return nil
 }
@@ -451,6 +518,104 @@ func (r *confluenceRenderer) isHeaderCell(node ast.Node) bool {
 	return false
 }
 
+func (r *confluenceRenderer) isTaskList(list *ast.List) bool {
+	if list == nil {
+		return false
+	}
+	hasItem := false
+	for child := list.FirstChild(); child != nil; child = child.NextSibling() {
+		item, ok := child.(*ast.ListItem)
+		if !ok {
+			continue
+		}
+		hasItem = true
+		if _, found := r.taskItemCheckboxState(item); !found {
+			return false
+		}
+	}
+	return hasItem
+}
+
+func (r *confluenceRenderer) taskItemCheckboxState(item ast.Node) (bool, bool) {
+	for child := item.FirstChild(); child != nil; child = child.NextSibling() {
+		if checked, found := r.findTaskCheckBox(child); found {
+			return checked, true
+		}
+	}
+	return false, false
+}
+
+func (r *confluenceRenderer) findTaskCheckBox(node ast.Node) (bool, bool) {
+	if checkbox, ok := node.(*extensionast.TaskCheckBox); ok {
+		return checkbox.IsChecked, true
+	}
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		if checked, found := r.findTaskCheckBox(child); found {
+			return checked, true
+		}
+	}
+	return false, false
+}
+
+func (r *confluenceRenderer) isInTaskListContext(node ast.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		if r.taskLists[parent] {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *confluenceRenderer) openAdmonition(macroName string) {
+	r.admonitions = append(r.admonitions, macroName)
+	fmt.Fprintf(&r.buffer, "<ac:structured-macro ac:name=\"%s\">\n", html.EscapeString(macroName))
+	r.buffer.WriteString("<ac:rich-text-body>\n")
+}
+
+func (r *confluenceRenderer) closeAdmonition() {
+	if len(r.admonitions) == 0 {
+		return
+	}
+	r.admonitions = r.admonitions[:len(r.admonitions)-1]
+	r.buffer.WriteString("</ac:rich-text-body>\n")
+	r.buffer.WriteString("</ac:structured-macro>\n")
+}
+
+func (r *confluenceRenderer) hasOpenAdmonition() bool {
+	return len(r.admonitions) > 0
+}
+
+func parseAdmonitionStart(content string) (string, bool) {
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, ":::") {
+		return "", false
+	}
+	label := strings.TrimSpace(strings.TrimPrefix(trimmed, ":::"))
+	if label == "" {
+		return "", false
+	}
+	fields := strings.Fields(label)
+	if len(fields) == 0 {
+		return "", false
+	}
+	switch strings.ToLower(fields[0]) {
+	case "warning", "warn":
+		return "warning", true
+	case "note":
+		return "note", true
+	case "info":
+		return "info", true
+	case "tip", "success", "hint":
+		return "tip", true
+	default:
+		return "", false
+	}
+}
+
+func isAdmonitionEnd(content string) bool {
+	return strings.TrimSpace(content) == ":::"
+}
+
 func parseFenceLanguage(info []byte) string {
 	trimmed := strings.TrimSpace(string(info))
 	if trimmed == "" {
@@ -476,6 +641,19 @@ func isPlantUMLLanguage(language string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func tableAlignmentStyle(alignment extensionast.Alignment) string {
+	switch alignment {
+	case extensionast.AlignLeft:
+		return "text-align:left;"
+	case extensionast.AlignCenter:
+		return "text-align:center;"
+	case extensionast.AlignRight:
+		return "text-align:right;"
+	default:
+		return ""
 	}
 }
 

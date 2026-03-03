@@ -90,3 +90,99 @@ func TestConvertTableHeaderIncludesHeaderRow(t *testing.T) {
 		t.Fatalf("table body cells not rendered as <td>")
 	}
 }
+
+func TestConvertAutoLinkEmailUsesMailto(t *testing.T) {
+	output, err := ConvertString("<foo@example.com>\n")
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+
+	if !strings.Contains(output, `<a href="mailto:foo@example.com">foo@example.com</a>`) {
+		t.Fatalf("email autolink is missing mailto prefix")
+	}
+}
+
+func TestConvertTaskListToConfluenceTasks(t *testing.T) {
+	input := "- [x] done\n- [ ] todo\n"
+	output, err := ConvertString(input)
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+
+	if !strings.Contains(output, "<ac:task-list>") {
+		t.Fatalf("task list wrapper not rendered")
+	}
+	if !strings.Contains(output, "<ac:task-status>complete</ac:task-status>") {
+		t.Fatalf("checked task status not rendered")
+	}
+	if !strings.Contains(output, "<ac:task-status>incomplete</ac:task-status>") {
+		t.Fatalf("unchecked task status not rendered")
+	}
+	if !strings.Contains(output, "<ac:task-body>done</ac:task-body>") {
+		t.Fatalf("checked task body not rendered")
+	}
+	if !strings.Contains(output, "<ac:task-body>todo</ac:task-body>") {
+		t.Fatalf("unchecked task body not rendered")
+	}
+	if strings.Contains(output, "[x]") || strings.Contains(output, "[ ]") {
+		t.Fatalf("task marker text should not appear in task-list mode")
+	}
+}
+
+func TestConvertNormalListUnaffected(t *testing.T) {
+	output, err := ConvertString("- item1\n- item2\n")
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+	if !strings.Contains(output, "<ul>") || !strings.Contains(output, "<li>item1</li>") {
+		t.Fatalf("normal bullet list should still use ul/li")
+	}
+}
+
+func TestConvertAdmonitionToConfluenceMacro(t *testing.T) {
+	input := ":::warning\n\nhello **world**\n\n:::\n"
+	output, err := ConvertString(input)
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+
+	if !strings.Contains(output, `<ac:structured-macro ac:name="warning">`) {
+		t.Fatalf("warning macro not rendered")
+	}
+	if !strings.Contains(output, "<ac:rich-text-body>") {
+		t.Fatalf("warning rich-text-body not rendered")
+	}
+	if !strings.Contains(output, "<p>hello <strong>world</strong></p>") {
+		t.Fatalf("warning body not rendered correctly")
+	}
+	if strings.Contains(output, ":::warning") || strings.Contains(output, "<p>:::</p>") {
+		t.Fatalf("admonition markers should not appear in output")
+	}
+}
+
+func TestConvertTableAlignment(t *testing.T) {
+	input := "| L | C | R |\n|:--|:-:|--:|\n|1|2|3|\n"
+	output, err := ConvertString(input)
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+
+	if !strings.Contains(output, `<th style="text-align:left;">L</th>`) {
+		t.Fatalf("left alignment not rendered on header")
+	}
+	if !strings.Contains(output, `<th style="text-align:center;">C</th>`) {
+		t.Fatalf("center alignment not rendered on header")
+	}
+	if !strings.Contains(output, `<th style="text-align:right;">R</th>`) {
+		t.Fatalf("right alignment not rendered on header")
+	}
+	if !strings.Contains(output, `<td style="text-align:left;">1</td>`) {
+		t.Fatalf("left alignment not rendered on body cell")
+	}
+	if !strings.Contains(output, `<td style="text-align:center;">2</td>`) {
+		t.Fatalf("center alignment not rendered on body cell")
+	}
+	if !strings.Contains(output, `<td style="text-align:right;">3</td>`) {
+		t.Fatalf("right alignment not rendered on body cell")
+	}
+}

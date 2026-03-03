@@ -11,6 +11,8 @@
   - `[TOC]` -> `toc` macro
   - ```` ```mermaid ```` -> `mermaid-macro` macro
   - ```` ```plantuml ```` / ```` ```puml ```` -> `plantuml` macro
+  - `- [ ]` / `- [x]` -> `ac:task-list`（Confluence 原生 checkbox）
+  - `:::warning|note|info|tip` -> 对应 Confluence 提示宏
   - 其他代码块 -> `code` macro（自动带 `language` 参数）
 
 ## 安装
