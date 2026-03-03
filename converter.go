@@ -333,9 +333,9 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			return ast.WalkContinue, nil
 		case *extensionast.TableHeader:
 			if entering {
-				r.buffer.WriteString("<thead>\n")
+				r.buffer.WriteString("<thead>\n<tr>\n")
 			} else {
-				r.buffer.WriteString("</thead>\n")
+				r.buffer.WriteString("</tr>\n</thead>\n")
 			}
 			return ast.WalkContinue, nil
 		case *extensionast.TableRow:

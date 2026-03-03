@@ -69,3 +69,24 @@ func TestConvertPlantUMLAliasAndMacroNameOverride(t *testing.T) {
 		t.Fatalf("custom plantuml macro not found in output")
 	}
 }
+
+func TestConvertTableHeaderIncludesHeaderRow(t *testing.T) {
+	input := "| Name | Age |\n|---|---|\n| Alice | 18 |\n"
+	output, err := ConvertString(input)
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+
+	if !strings.Contains(output, "<thead>\n<tr>\n") {
+		t.Fatalf("table header row not found")
+	}
+	if !strings.Contains(output, "</tr>\n</thead>\n") {
+		t.Fatalf("table header row closing tags not found")
+	}
+	if !strings.Contains(output, "<th>Name</th>") || !strings.Contains(output, "<th>Age</th>") {
+		t.Fatalf("table header cells not rendered as <th>")
+	}
+	if !strings.Contains(output, "<td>Alice</td>") || !strings.Contains(output, "<td>18</td>") {
+		t.Fatalf("table body cells not rendered as <td>")
+	}
+}
