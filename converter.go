@@ -19,10 +19,11 @@ var fenceLanguagePattern = regexp.MustCompile(`^[A-Za-z0-9_+\-.#]+$`)
 
 // Options controls how markdown is converted to Confluence HTML.
 type Options struct {
-	EnableTOCMacro   bool
-	TOCMacroName     string
-	CodeMacroName    string
-	MermaidMacroName string
+	EnableTOCMacro    bool
+	TOCMacroName      string
+	CodeMacroName     string
+	MermaidMacroName  string
+	PlantUMLMacroName string
 }
 
 // Option applies configuration to the converter.
@@ -55,6 +56,15 @@ func WithMermaidMacroName(name string) Option {
 	}
 }
 
+// WithPlantUMLMacroName overrides the PlantUML macro name. Default is "plantuml".
+func WithPlantUMLMacroName(name string) Option {
+	return func(o *Options) {
+		if strings.TrimSpace(name) != "" {
+			o.PlantUMLMacroName = strings.TrimSpace(name)
+		}
+	}
+}
+
 // WithTOCMacroEnabled enables or disables [TOC] conversion.
 func WithTOCMacroEnabled(enabled bool) Option {
 	return func(o *Options) {
@@ -70,10 +80,11 @@ type Converter struct {
 
 func defaultOptions() Options {
 	return Options{
-		EnableTOCMacro:   true,
-		TOCMacroName:     "toc",
-		CodeMacroName:    "code",
-		MermaidMacroName: "mermaid-macro",
+		EnableTOCMacro:    true,
+		TOCMacroName:      "toc",
+		CodeMacroName:     "code",
+		MermaidMacroName:  "mermaid-macro",
+		PlantUMLMacroName: "plantuml",
 	}
 }
 
@@ -296,6 +307,8 @@ func (r *confluenceRenderer) render(document ast.Node) error {
 			content := r.linesText(typed.Lines())
 			if strings.EqualFold(language, "mermaid") {
 				r.renderMermaidMacro(content)
+			} else if isPlantUMLLanguage(language) {
+				r.renderPlantUMLMacro(content)
 			} else {
 				r.renderCodeMacro(language, content)
 			}
@@ -389,6 +402,14 @@ func (r *confluenceRenderer) renderMermaidMacro(content string) {
 	r.buffer.WriteString("</ac:structured-macro>\n")
 }
 
+func (r *confluenceRenderer) renderPlantUMLMacro(content string) {
+	fmt.Fprintf(&r.buffer, "<ac:structured-macro ac:name=\"%s\">\n", html.EscapeString(r.opts.PlantUMLMacroName))
+	r.buffer.WriteString("<ac:plain-text-body><![CDATA[")
+	r.buffer.WriteString(escapeCDATA(content))
+	r.buffer.WriteString("]]></ac:plain-text-body>\n")
+	r.buffer.WriteString("</ac:structured-macro>\n")
+}
+
 func (r *confluenceRenderer) linesText(lines *text.Segments) string {
 	var content strings.Builder
 	for i := 0; i < lines.Len(); i++ {
@@ -447,6 +468,15 @@ func parseFenceLanguage(info []byte) string {
 		return ""
 	}
 	return strings.ToLower(first)
+}
+
+func isPlantUMLLanguage(language string) bool {
+	switch strings.ToLower(strings.TrimSpace(language)) {
+	case "plantuml", "puml":
+		return true
+	default:
+		return false
+	}
 }
 
 func escapeCDATA(raw string) string {

@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-func TestConvertTOCMermaidAndCode(t *testing.T) {
+func TestConvertTOCMermaidPlantUMLAndCode(t *testing.T) {
 	input := `# Demo
 
 [TOC]
 
-` + "```mermaid\nflowchart TD\nA-->B\n```\n\n```go\nfmt.Println(\"hi\")\n```\n"
+` + "```mermaid\nflowchart TD\nA-->B\n```\n\n```plantuml\n@startuml\nAlice -> Bob: hello\n@enduml\n```\n\n```go\nfmt.Println(\"hi\")\n```\n"
 
 	output, err := ConvertString(input)
 	if err != nil {
@@ -23,6 +23,9 @@ func TestConvertTOCMermaidAndCode(t *testing.T) {
 	}
 	if !strings.Contains(output, `<ac:structured-macro ac:name="mermaid-macro">`) {
 		t.Fatalf("mermaid macro not found in output")
+	}
+	if !strings.Contains(output, `<ac:structured-macro ac:name="plantuml">`) {
+		t.Fatalf("plantuml macro not found in output")
 	}
 	if !strings.Contains(output, `<ac:structured-macro ac:name="code">`) {
 		t.Fatalf("code macro not found in output")
@@ -52,5 +55,17 @@ func TestConvertSampleMarkdown(t *testing.T) {
 	}
 	if !strings.Contains(html, `<ac:structured-macro ac:name="code">`) {
 		t.Fatalf("code macro not found in converted sample")
+	}
+}
+
+func TestConvertPlantUMLAliasAndMacroNameOverride(t *testing.T) {
+	input := "```puml\n@startuml\nA -> B\n@enduml\n```"
+	output, err := ConvertString(input, WithPlantUMLMacroName("plantumlrender"))
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+
+	if !strings.Contains(output, `<ac:structured-macro ac:name="plantumlrender">`) {
+		t.Fatalf("custom plantuml macro not found in output")
 	}
 }

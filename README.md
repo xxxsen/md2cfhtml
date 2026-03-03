@@ -10,6 +10,7 @@
 - 针对常见 Confluence 场景做了专门处理：
   - `[TOC]` -> `toc` macro
   - ```` ```mermaid ```` -> `mermaid-macro` macro
+  - ```` ```plantuml ```` / ```` ```puml ```` -> `plantuml` macro
   - 其他代码块 -> `code` macro（自动带 `language` 参数）
 
 ## 安装
@@ -116,6 +117,7 @@ html, err := md2cfhtml.Convert([]byte(markdown),
 	md2cfhtml.WithTOCMacroName("toc"),
 	md2cfhtml.WithCodeMacroName("code"),
 	md2cfhtml.WithMermaidMacroName("mermaid-macro"),
+	md2cfhtml.WithPlantUMLMacroName("plantuml"),
 	md2cfhtml.WithTOCMacroEnabled(true),
 )
 ```
